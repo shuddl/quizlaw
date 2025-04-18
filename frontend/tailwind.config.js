@@ -11,6 +11,9 @@ export default {
           DEFAULT: '#ff0000',
           dark: '#cc0000',
           light: '#ff3333'
+        },
+        background: {
+          DEFAULT: '#ffffff'  // Adding the background color that was missing
         }
       },
       animation: {

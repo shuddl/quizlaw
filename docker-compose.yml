@@ -8,7 +8,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./backend:/app
+      - /Users/spencerpro/Documents/GitHub/quizlaw/backend:/app
     env_file:
       - ./backend/.env
     depends_on:
@@ -22,9 +22,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile.dev
     ports:
-      - "5173:5173"
+      - "3000:3000"  # Using port 3000 as requested
     volumes:
-      - ./frontend:/app
+      - /Users/spencerpro/Documents/GitHub/quizlaw/frontend:/app
       - /app/node_modules
     environment:
       - VITE_API_URL=http://localhost:5000

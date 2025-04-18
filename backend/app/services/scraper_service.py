@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import Dict, List, Any, Tuple, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -73,31 +74,83 @@ async def parse_division_page(html: str, base_url: str) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
     section_links = []
     
-    # This is a placeholder - actual selectors would depend on the target website structure
     try:
-        # Primary selector strategy
+        # Primary selector strategy - handles most common cases
         links = soup.select("div.section-list a.section-link")
         
         # Fallback selector strategy if primary fails
         if not links:
             links = soup.select("table.sections-table td a")
         
-        # Another fallback
+        # Try common code section patterns
+        if not links:
+            links = soup.select("ul.sections li a")
+            
+        # Try code browser patterns
+        if not links:
+            links = soup.select("div.code-browser a.section")
+        
+        # Another fallback - look for any links containing "section"
         if not links:
             links = soup.find_all("a", href=lambda href: href and "section" in href.lower())
+            
+        # Last resort - any links with numeric patterns that might be section IDs
+        if not links:
+            links = soup.find_all("a", href=lambda href: href and re.search(r'\d+[.-]\d+', href))
         
+        # Process found links
         for link in links:
             href = link.get("href")
             if href:
                 # Construct absolute URL
                 section_url = urljoin(base_url, href)
                 section_links.append(section_url)
+                
+        # If we found too many links (possible false positives), filter them
+        if len(section_links) > 200:
+            logger.warning(f"Found unusually large number of links ({len(section_links)}), filtering...")
+            # Keep only those that match common section patterns
+            section_links = [url for url in section_links if re.search(r'(section|§|code)', url, re.IGNORECASE)]
     
     except Exception as e:
         logger.error(f"Error parsing division page: {str(e)}")
         raise ParseError(f"Failed to parse division page: {str(e)}") from e
     
     return section_links
+
+
+async def extract_footnotes(soup: BeautifulSoup) -> Dict[str, str]:
+    """
+    Extract footnotes from a section page.
+    
+    Args:
+        soup: BeautifulSoup object of the page
+        
+    Returns:
+        Dictionary mapping footnote numbers to footnote text
+    """
+    footnotes = {}
+    
+    # Find common footnote patterns
+    footnote_elements = (
+        soup.select("div.footnotes li") or
+        soup.select("div.footnotes p") or
+        soup.select("ol.footnotes li") or
+        soup.select("div.annotations p") or
+        soup.find_all("div", class_=lambda c: c and "footnote" in c.lower()) or
+        soup.find_all("sup", class_=lambda c: c and "footnote" in c.lower())
+    )
+    
+    for elem in footnote_elements:
+        # Try to extract footnote number and text
+        footnote_text = elem.get_text(strip=True)
+        match = re.search(r'^(\d+)[.:]?\s+(.*)', footnote_text)
+        
+        if match:
+            num, text = match.groups()
+            footnotes[num] = text
+    
+    return footnotes
 
 
 async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
@@ -116,13 +169,14 @@ async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
         "source_url": url,
     }
     
-    # This is a placeholder - actual selectors would depend on the target website structure
     try:
         # Extract section number - try multiple selectors
         section_number_elem = (
             soup.select_one("span.section-number") or
             soup.select_one("h1 .section-num") or
-            soup.select_one("div.section-header .number")
+            soup.select_one("div.section-header .number") or
+            soup.select_one("p.section-number") or
+            soup.select_one("[id^='section-']")
         )
         
         if section_number_elem:
@@ -132,14 +186,13 @@ async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
             title = soup.title.string if soup.title else ""
             if "Section" in title and any(c.isdigit() for c in title):
                 # Extract section number from title
-                import re
                 section_match = re.search(r'Section\s+([0-9.-]+)', title)
                 if section_match:
                     section_data["section_number"] = section_match.group(1)
             else:
                 # Try to extract from URL
                 path = urlparse(url).path
-                section_match = re.search(r'section[-_]?([0-9.-]+)', path, re.IGNORECASE)
+                section_match = re.search(r'section[-_]?([0-9.-]+)', path, re.IGNORECASE) or re.search(r'([0-9]+[.-][0-9]+)', path)
                 if section_match:
                     section_data["section_number"] = section_match.group(1)
                 else:
@@ -149,7 +202,9 @@ async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
         section_title_elem = (
             soup.select_one("h1.section-title") or
             soup.select_one("div.section-header h2") or
-            soup.select_one("span.title")
+            soup.select_one("span.title") or
+            soup.select_one("h2.title") or
+            soup.select_one("div.title")
         )
         
         if section_title_elem:
@@ -164,11 +219,16 @@ async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
             else:
                 section_data["section_title"] = "Unknown Title"
         
+        # Extract footnotes that might be needed for full context
+        footnotes = await extract_footnotes(soup)
+        
         # Extract section text
         section_text_elem = (
             soup.select_one("div.section-content") or
             soup.select_one("div.section-text") or
-            soup.select_one("div.content")
+            soup.select_one("div.content") or
+            soup.select_one("div.statutory-body") or
+            soup.select_one("div.code-text")
         )
         
         if section_text_elem:
@@ -185,10 +245,30 @@ async def parse_section_page(html: str, url: str) -> Dict[str, Any]:
             else:
                 raise ParseError(f"Could not extract section text from {url}")
         
+        # Handle multi-part sections and subsections
+        section_parts = {}
+        subsection_elements = section_text_elem.select("p.subsection") if section_text_elem else []
+        
+        if subsection_elements:
+            for i, subsection in enumerate(subsection_elements):
+                label = subsection.select_one(".label")
+                text = subsection.select_one(".text")
+                if label and text:
+                    section_parts[label.get_text(strip=True)] = text.get_text(strip=True)
+            
+            if section_parts:
+                section_data["structured_content"] = section_parts
+        
+        # If we found footnotes, include them in the data
+        if footnotes:
+            section_data["footnotes"] = footnotes
+        
         # Extract division (assuming it can be derived from the page)
         division_elem = (
             soup.select_one("div.breadcrumb .division") or
-            soup.select_one("span.division-name")
+            soup.select_one("span.division-name") or
+            soup.select_one("div.breadcrumbs a") or
+            soup.select_one("ol.breadcrumb li a")
         )
         
         if division_elem:
@@ -247,7 +327,7 @@ async def store_scraped_section(session: AsyncSession, section_data: Dict[str, A
 
 
 async def scrape_division(
-    session: AsyncSession, target_url: str
+    session: AsyncSession, target_url: str, concurrent_requests: int = 3
 ) -> Dict[str, Any]:
     """
     Scrape all sections within a division.
@@ -255,6 +335,7 @@ async def scrape_division(
     Args:
         session: Database session
         target_url: URL of the division page
+        concurrent_requests: Number of concurrent requests to make
         
     Returns:
         Dictionary with scraping statistics
@@ -281,35 +362,106 @@ async def scrape_division(
             stats["sections_found"] = len(section_urls)
             logger.info(f"Found {len(section_urls)} section pages to scrape")
             
-            # Scrape each section
-            for section_url in section_urls:
-                try:
-                    logger.debug(f"Fetching section page: {section_url}")
-                    section_html = await fetch_page(client, section_url)
-                    section_data = await parse_section_page(section_html, section_url)
-                    
-                    # Store section in database
-                    success, result = await store_scraped_section(session, section_data)
-                    
-                    if success:
-                        stats["sections_scraped"] += 1
-                        if result == "created":
-                            stats["sections_created"] += 1
-                        elif result == "updated":
-                            stats["sections_updated"] += 1
-                    else:
-                        stats["errors"] += 1
-                        logger.error(f"Failed to store section {section_url}: {result}")
+            # Process sections in batches for controlled concurrency
+            for i in range(0, len(section_urls), concurrent_requests):
+                batch = section_urls[i:i + concurrent_requests]
+                tasks = []
                 
-                except (NetworkError, ParseError, SectionNotFoundError) as e:
-                    stats["errors"] += 1
-                    logger.error(f"Error scraping section {section_url}: {str(e)}")
+                for section_url in batch:
+                    tasks.append(process_section(client, session, section_url, stats))
                 
-                # Add a small delay to avoid overloading the server
-                await asyncio.sleep(0.5)
+                await asyncio.gather(*tasks)
+                
+                # Add a small delay between batches
+                await asyncio.sleep(1.0)
         
         except Exception as e:
             logger.error(f"Error in scrape_division: {str(e)}")
             stats["errors"] += 1
     
     return stats
+
+
+async def process_section(
+    client: httpx.AsyncClient, 
+    session: AsyncSession, 
+    section_url: str,
+    stats: Dict[str, int]
+) -> None:
+    """
+    Process a single section page.
+    
+    Args:
+        client: HTTP client
+        session: Database session
+        section_url: URL of the section page
+        stats: Statistics dictionary to update
+    """
+    try:
+        logger.debug(f"Fetching section page: {section_url}")
+        section_html = await fetch_page(client, section_url)
+        section_data = await parse_section_page(section_html, section_url)
+        
+        # Store section in database
+        success, result = await store_scraped_section(session, section_data)
+        
+        if success:
+            stats["sections_scraped"] += 1
+            if result == "created":
+                stats["sections_created"] += 1
+                logger.info(f"Created new section: {section_data.get('section_number', 'Unknown')}")
+            elif result == "updated":
+                stats["sections_updated"] += 1
+                logger.info(f"Updated section: {section_data.get('section_number', 'Unknown')}")
+        else:
+            stats["errors"] += 1
+            logger.error(f"Failed to store section {section_url}: {result}")
+    
+    except (NetworkError, ParseError, SectionNotFoundError) as e:
+        stats["errors"] += 1
+        logger.error(f"Error scraping section {section_url}: {str(e)}")
+
+
+async def scrape_multiple_divisions(
+    session: AsyncSession, division_urls: List[str]
+) -> Dict[str, Any]:
+    """
+    Scrape multiple divisions in sequence.
+    
+    Args:
+        session: Database session
+        division_urls: List of division URLs to scrape
+        
+    Returns:
+        Dictionary with combined scraping statistics
+    """
+    combined_stats = {
+        "divisions_attempted": len(division_urls),
+        "divisions_completed": 0,
+        "sections_found": 0,
+        "sections_scraped": 0,
+        "sections_created": 0,
+        "sections_updated": 0,
+        "errors": 0,
+    }
+    
+    for url in division_urls:
+        try:
+            logger.info(f"Starting to scrape division: {url}")
+            division_stats = await scrape_division(session, url)
+            
+            # Update combined stats
+            combined_stats["sections_found"] += division_stats["sections_found"]
+            combined_stats["sections_scraped"] += division_stats["sections_scraped"]
+            combined_stats["sections_created"] += division_stats["sections_created"]
+            combined_stats["sections_updated"] += division_stats["sections_updated"]
+            combined_stats["errors"] += division_stats["errors"]
+            
+            combined_stats["divisions_completed"] += 1
+            logger.info(f"Completed scraping division: {url}")
+            
+        except Exception as e:
+            combined_stats["errors"] += 1
+            logger.error(f"Failed to scrape division {url}: {str(e)}")
+    
+    return combined_stats
